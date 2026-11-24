@@ -49,6 +49,22 @@ brew install --cask swiftbar
 This symlinks the plugin into SwiftBar's plugin folder (setting that to
 `~/.config/swiftbar` if you haven't picked one) and restarts SwiftBar.
 
+## Quick Settings (GNOME)
+
+`gnome/` holds a small GNOME Shell extension (GNOME 45+) that adds a "Monitor"
+tile to the Quick Settings panel, next to Wi-Fi and Bluetooth. Clicking the
+tile switches to `TARGET` (DP-2 by default). The arrow opens a list of all
+inputs, with a check next to the current one. Edit `TARGET` at the top of
+`gnome/msw@davidtjones.github.io/extension.js` to change the main input.
+
+```
+./gnome/install.sh
+```
+
+This symlinks the extension into `~/.local/share/gnome-shell/extensions` and
+enables it. Log out and back in to load it, and again after any change to the
+extension (GNOME on Wayland can't reload extensions in place).
+
 ## Naming inputs
 
 Run `msw setup` from any machine plugged into the monitor. For each input the
