@@ -114,7 +114,9 @@ Darwin)
             m1ddc "$@"
         fi
     }
-    be_get() { printf '%02x\n' "$(m1 get input)"; }
+    # Some monitors (e.g. Dell) repeat the value in the high byte; only the
+    # low byte is the input.
+    be_get() { printf '%02x\n' "$(( $(m1 get input) & 0xff ))"; }
     be_set() { m1 set input "$(printf '%d' "0x$1")"; }
     # m1ddc can't read capabilities, so fall back to the standard table.
     be_list() { printf '%s\n' "$TABLE" | awk '{ print $1 }'; }
