@@ -1,0 +1,162 @@
+#!/bin/sh
+# msw - monitor switch. Switch a monitor's input source over DDC/CI.
+#
+# Linux: uses ddcutil. macOS (Apple Silicon): uses m1ddc.
+# Input source is MCCS VCP feature 0x60.
+
+set -eu
+
+usage() {
+    cat <<'EOF'
+Usage: msw [-d N] <input>    switch to <input>
+       msw [-d N] ls         list inputs (* = current)
+       msw [-d N] get        print current input
+
+<input> is a name like DP-1, dp1, HDMI-2, hdmi2, usbc
+or a raw value like 0x11 or 17.
+
+-d N   target display N (default: first display found)
+
+Non-standard values can be named in ~/.config/msw/inputs,
+one "<hex> <name>" per line, e.g. "13 DP-2".
+EOF
+}
+
+die() { printf 'msw: %s\n' "$*" >&2; exit 1; }
+
+# Standard MCCS input values (plus common vendor extras).
+TABLE='01 VGA-1
+02 VGA-2
+03 DVI-1
+04 DVI-2
+0f DP-1
+10 DP-2
+11 HDMI-1
+12 HDMI-2
+1b USB-C'
+
+# Optional overrides for monitors that use non-standard values.
+# One "<hex> <name>" per line, e.g. "13 DP-2". These win over the table above.
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/msw/inputs
+if [ -r "$CONFIG" ]; then
+    overrides=$(awk '!/^[[:space:]]*(#|$)/ { sub(/^0[xX]/, "", $1); print tolower($1), toupper($2) }' "$CONFIG")
+    TABLE="$overrides
+$TABLE"
+fi
+
+# hex (2 digits, lowercase) -> display name
+name_of() {
+    n=$(printf '%s\n' "$TABLE" | awk -v v="$1" '$1 == v { print $2; exit }')
+    printf '%s\n' "${n:-unknown}"
+}
+
+# user input -> 2-digit lowercase hex value
+parse_input() {
+    raw=$1
+    case $raw in
+        0x*|0X*) v=$(printf '%d' "$raw" 2>/dev/null) || die "bad value: $raw" ;;
+        *[!0-9]*)
+            key=$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' _-')
+            case $key in
+                DISPLAYPORT*) key="DP${key#DISPLAYPORT}" ;;
+                USBC1) key=USBC ;;
+            esac
+            hex=$(printf '%s\n' "$TABLE" | awk -v k="$key" '
+                { n = $2; gsub(/-/, "", n); if (n == k) { print $1; exit } }')
+            [ -n "$hex" ] || die "unknown input: $raw (try 'msw ls')"
+            printf '%s\n' "$hex"
+            return ;;
+        *) v=$raw ;;
+    esac
+    [ "$v" -ge 1 ] && [ "$v" -le 255 ] || die "value out of range: $raw"
+    printf '%02x\n' "$v"
+}
+
+# --- backends ---------------------------------------------------------------
+# Each backend provides: be_get (prints hex), be_set <hex>, be_list (prints hex
+# values the monitor supports, one per line).
+
+DISPLAY_NUM=
+
+case $(uname -s) in
+Linux)
+    command -v ddcutil >/dev/null || die "ddcutil not found (install it from your package manager)"
+
+    ddc() {
+        if [ -n "$DISPLAY_NUM" ]; then
+            ddcutil --display "$DISPLAY_NUM" "$@"
+        else
+            ddcutil "$@"
+        fi
+    }
+    be_get() {
+        # Terse output looks like: VCP 60 SNC x0f
+        ddc getvcp 60 --terse | awk '$1 == "VCP" { sub(/^x/, "", $4); print $4 }'
+    }
+    be_set() {
+        # --noverify: the monitor often stops answering once it switches away.
+        ddc setvcp 60 "0x$1" --noverify
+    }
+    be_list() {
+        ddc capabilities | awk '
+            /Feature: 60 / { in60 = 1; next }
+            in60 && /Feature:/ { exit }
+            in60 && /^ *[0-9a-fA-F][0-9a-fA-F]:/ { sub(/:.*/, ""); gsub(/ /, ""); print tolower($0) }'
+    }
+    ;;
+Darwin)
+    command -v m1ddc >/dev/null || die "m1ddc not found (brew install m1ddc)"
+
+    m1() {
+        if [ -n "$DISPLAY_NUM" ]; then
+            m1ddc display "$DISPLAY_NUM" "$@"
+        else
+            m1ddc "$@"
+        fi
+    }
+    be_get() { printf '%02x\n' "$(m1 get input)"; }
+    be_set() { m1 set input "$(printf '%d' "0x$1")"; }
+    # m1ddc can't read capabilities, so fall back to the standard table.
+    be_list() { printf '%s\n' "$TABLE" | awk '{ print $1 }'; }
+    ;;
+*)
+    die "unsupported OS: $(uname -s)"
+    ;;
+esac
+
+# --- main -------------------------------------------------------------------
+
+while getopts d:h opt; do
+    case $opt in
+        d) DISPLAY_NUM=$OPTARG ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+
+case $1 in
+    ls|list)
+        cur=$(be_get 2>/dev/null || true)
+        vals=$(be_list 2>/dev/null || true)
+        [ -n "$vals" ] || vals=$(printf '%s\n' "$TABLE" | awk '{ print $1 }')
+        for v in $vals; do
+            mark=' '
+            [ "$v" = "$cur" ] && mark='*'
+            printf '%s %-8s (0x%s)\n' "$mark" "$(name_of "$v")" "$v"
+        done
+        ;;
+    get)
+        cur=$(be_get) || die "could not read current input"
+        printf '%s (0x%s)\n' "$(name_of "$cur")" "$cur"
+        ;;
+    help)
+        usage
+        ;;
+    *)
+        hex=$(parse_input "$1")
+        be_set "$hex"
+        ;;
+esac
