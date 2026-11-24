@@ -1,7 +1,8 @@
 // Monitor Switch: a Quick Settings tile for msw.
 //
-// Clicking the tile switches the monitor to TARGET. The arrow opens a list of
-// every input (from `msw ls`), with a check next to the current one.
+// Clicking the tile switches the monitor to TARGET. The arrow opens a menu
+// with every input (from `msw ls`), plus PIP/PBP controls on monitors that
+// support them: the layout, the second input, and a swap button.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -35,21 +36,35 @@ async function msw(args, cancellable) {
     return stdout;
 }
 
-// `msw ls` lines look like "* linux (0x0f, DP-1)" or "  unknown (0x13)".
-// Unnamed inputs are listed by their raw value, which msw also accepts.
+// Parse a label like "linux (0x0f, DP-1)" or "pbp 50 (0x24)".
+function parseLabel(text) {
+    const m = text.match(/^(.+?) \(0x([0-9a-f]{2})/);
+    return m ? {name: m[1], hex: m[2]} : null;
+}
+
+// Parse `msw ls` or `msw layouts`: one label per line, "*" marks the current.
 function parseList(text) {
-    const inputs = [];
+    const entries = [];
     for (const line of text.split('\n')) {
-        const m = line.match(/^([* ]) (\S+) \(0x([0-9a-f]{2})/);
-        if (!m)
-            continue;
-        const [, mark, name, hex] = m;
-        inputs.push({
-            name: name === 'unknown' ? `0x${hex}` : name,
-            current: mark === '*',
-        });
+        const m = line.match(/^([* ]) (.*)$/);
+        const entry = m && parseLabel(m[2]);
+        if (entry)
+            entries.push({...entry, current: m[1] === '*'});
     }
-    return inputs;
+    return entries;
+}
+
+// Unnamed inputs are shown and selected by their raw value, which msw accepts.
+function inputName(entry) {
+    return entry.name === 'unknown' ? `0x${entry.hex}` : entry.name;
+}
+
+// "pbp 50" -> "PBP 50", "pip small" -> "PIP small", "off" -> "Off"
+function layoutTitle(name) {
+    const [kind, ...rest] = name.split(' ');
+    if (rest.length === 0)
+        return kind.charAt(0).toUpperCase() + kind.slice(1);
+    return [kind.toUpperCase(), ...rest].join(' ');
 }
 
 function isCancelled(e) {
@@ -71,11 +86,11 @@ class MonitorToggle extends QuickMenuToggle {
         this._refreshId = 0;
 
         this.menu.setHeader(ICON, 'Monitor Input');
-        this._inputs = new PopupMenu.PopupMenuSection();
-        this.menu.addMenuItem(this._inputs);
+        this._content = new PopupMenu.PopupMenuSection();
+        this.menu.addMenuItem(this._content);
 
-        this.connect('clicked', () => this._switch(TARGET));
-        // Re-read inputs each time the list opens, so it's never stale.
+        this.connect('clicked', () => this._run([TARGET]));
+        // Re-read everything each time the menu opens, so it's never stale.
         this.menu.connect('open-state-changed', (_menu, open) => {
             if (open)
                 this._refresh();
@@ -84,9 +99,15 @@ class MonitorToggle extends QuickMenuToggle {
     }
 
     _setMessage(text) {
-        this._inputs.removeAll();
-        const item = new PopupMenu.PopupMenuItem(text, {reactive: false});
-        this._inputs.addMenuItem(item);
+        this._content.removeAll();
+        this._content.addMenuItem(new PopupMenu.PopupMenuItem(text, {reactive: false}));
+    }
+
+    _addItem(menu, text, args, checked) {
+        const item = new PopupMenu.PopupMenuItem(text);
+        item.setOrnament(checked ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
+        item.connect('activate', () => this._run(args));
+        menu.addMenuItem(item);
     }
 
     async _refresh() {
@@ -94,9 +115,19 @@ class MonitorToggle extends QuickMenuToggle {
         const id = ++this._refreshId;
         this._setMessage('Loading…');
 
-        let inputs;
+        // Run one at a time: they all talk to the monitor over the same bus.
+        let inputs, layouts = [], second = null;
         try {
             inputs = parseList(await msw(['ls'], this._cancellable));
+            // PIP/PBP is optional: monitors without it just don't get those items.
+            try {
+                layouts = parseList(await msw(['layouts'], this._cancellable));
+                second = parseLabel((await msw(['get', 'second'], this._cancellable)).trim());
+            } catch (e) {
+                if (isCancelled(e))
+                    throw e;
+                layouts = [];
+            }
         } catch (e) {
             if (isCancelled(e) || id !== this._refreshId)
                 return;
@@ -112,23 +143,51 @@ class MonitorToggle extends QuickMenuToggle {
             return;
         }
 
-        this._inputs.removeAll();
+        this._content.removeAll();
+        for (const input of inputs)
+            this._addItem(this._content, inputName(input), [inputName(input)], input.current);
+
+        // Without a pxp config, only "off" is listed: no PIP/PBP controls.
+        if (layouts.length <= 1)
+            return;
+
+        this._content.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        const layout = layouts.find(l => l.current);
+        const layoutMenu = new PopupMenu.PopupSubMenuMenuItem(
+            `Layout: ${layout ? layoutTitle(layout.name) : 'unknown'}`);
+        for (const l of layouts) {
+            if (l.name === 'unknown')
+                continue;
+            this._addItem(layoutMenu.menu, layoutTitle(l.name), l.name.split(' '), l.current);
+        }
+        this._content.addMenuItem(layoutMenu);
+
+        const main = inputs.find(i => i.current);
+        const secondName = second ? inputName(second) : 'unknown';
+        const secondMenu = new PopupMenu.PopupSubMenuMenuItem(`Second input: ${secondName}`);
         for (const input of inputs) {
-            const item = new PopupMenu.PopupMenuItem(input.name);
-            item.setOrnament(input.current
-                ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
-            item.connect('activate', () => this._switch(input.name));
-            this._inputs.addMenuItem(item);
+            if (input === main)
+                continue;
+            this._addItem(secondMenu.menu, inputName(input),
+                ['second', inputName(input)], input.hex === second?.hex);
+        }
+        this._content.addMenuItem(secondMenu);
+
+        if (layout && layout.name !== 'off') {
+            const swap = new PopupMenu.PopupMenuItem('Swap inputs');
+            swap.connect('activate', () => this._run(['swap']));
+            this._content.addMenuItem(swap);
         }
     }
 
-    async _switch(input) {
+    async _run(args) {
         Main.panel.closeQuickSettings();
         try {
-            await msw([input], this._cancellable);
+            await msw(args, this._cancellable);
         } catch (e) {
             if (!isCancelled(e))
-                Main.notifyError('Couldn’t switch monitor input', e.message);
+                Main.notifyError('Monitor Switch', e.message);
         }
     }
 });

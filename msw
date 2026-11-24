@@ -13,11 +13,13 @@ usage() {
     cat <<'EOF'
 Usage: msw [-d N] <input>               switch to <input>
        msw [-d N] ls                    list inputs (* = current)
-       msw [-d N] get                   print current input
+       msw [-d N] get [second|layout]   print current input (or second input, layout)
        msw [-d N] status                print input, PIP/PBP layout and second input
        msw [-d N] setup                 preview each input and give it a name
        msw [-d N] pip [size] [input]    picture-in-picture, e.g. msw pip small macbook
        msw [-d N] pbp [split] [input]   side by side, e.g. msw pbp 50 macbook
+       msw [-d N] layouts               list PIP/PBP layouts (* = current)
+       msw [-d N] second <input>        set the second input
        msw [-d N] swap                  swap the main and second input
        msw [-d N] off                   turn PIP/PBP off
 
@@ -93,13 +95,13 @@ find_layout() {
         $2 == k { m = toupper($3); gsub(/[-_ ]/, "", m); if (n == "" || m == n) { print $1; exit } }'
 }
 
-# layout_label <hex> -> "pbp 50 (0x24)", "off", "unknown (0x2b)"
+# layout_label <hex> -> "pbp 50 (0x24)", "off (0x00)", "unknown (0x2b)"
 layout_label() {
     if [ "$1" = 00 ]; then
-        echo off
-        return
+        ll=off
+    else
+        ll=$(printf '%s\n' "$PXP_TABLE" | awk -v v="$1" '$1 == v { print $2, $3; exit }')
     fi
-    ll=$(printf '%s\n' "$PXP_TABLE" | awk -v v="$1" '$1 == v { print $2, $3; exit }')
     printf '%s (0x%s)\n' "${ll:-unknown}" "$1"
 }
 
@@ -165,8 +167,11 @@ Linux)
         # Terse output looks like "VCP 60 SNC x0f" for simple values, and
         # "VCP E9 CNC x00 xff x00 x24" (max high/low, current high/low) for
         # others. Only the low byte matters here.
-        ddc getvcp "$1" --terse | awk '$1 == "VCP" {
-            v = ($3 == "CNC") ? $7 : $4; if (v ~ /^x/) { sub(/^x/, "", v); print v } }'
+        gv=$(ddc getvcp "$1" --terse | awk '$1 == "VCP" {
+            v = ($3 == "CNC") ? $7 : $4; if (v ~ /^x/) { sub(/^x/, "", v); print v } }')
+        # ddcutil prints "VCP E9 ERR" for unsupported codes.
+        [ -n "$gv" ] || return 1
+        printf '%s\n' "$gv"
     }
     be_set_vcp() {
         # --noverify: the monitor often stops answering once it switches away.
@@ -255,7 +260,7 @@ check_name() {
     esac
     cn=$(norm "$1")
     case $cn in
-        LS|LIST|GET|STATUS|HELP|SETUP|PIP|PBP|SWAP|OFF|P)
+        LS|LIST|GET|STATUS|HELP|SETUP|PIP|PBP|LAYOUTS|SECOND|SWAP|OFF|P)
             echo "'$1' is reserved."; return 1 ;;
     esac
     if printf '%s' "$taken" | grep -qxF "$cn"; then
@@ -400,11 +405,32 @@ pxp() {
     if [ $# -eq 1 ]; then
         second=$(parse_input "$1" 2>/dev/null) ||
             die "'$1' isn't a $kind layout or an input (see $PXP_CONFIG and 'msw ls')"
-        main=$(be_get) || die "could not read the current input"
-        [ "$second" != "$main" ] || die "$1 is already the main input (use 'msw swap' to swap them)"
-        be_set_vcp "$VCP_SECOND" "$second"
+        set_second "$second" "$1"
     fi
     be_set_vcp "$VCP_LAYOUT" "$layout"
+}
+
+# set_second <hex> <name as typed>
+set_second() {
+    main=$(be_get) || die "could not read the current input"
+    [ "$1" != "$main" ] || die "$2 is already the main input (use 'msw swap' to swap them)"
+    be_set_vcp "$VCP_SECOND" "$1"
+}
+
+# List "off" and every layout in pxp, like `msw ls`. The current layout gets a
+# "*", and is added at the end if pxp doesn't know it.
+layouts() {
+    cur=$(be_get_vcp "$VCP_LAYOUT" 2>/dev/null) || cur=
+    vals=$(printf '00\n%s\n' "$PXP_TABLE" | awk 'NF && !seen[$1]++ { print $1 }')
+    case " $(printf '%s ' $vals)" in
+        *" $cur "*) ;;
+        *) if [ -n "$cur" ]; then vals="$vals $cur"; fi ;;
+    esac
+    for v in $vals; do
+        mark=' '
+        if [ "$v" = "$cur" ]; then mark='*'; fi
+        printf '%s %s\n' "$mark" "$(layout_label "$v")"
+    done
 }
 
 swap() {
@@ -450,6 +476,29 @@ case $cmd in
         pxp "$cmd" "$@"
         exit
         ;;
+    second)
+        [ $# -eq 1 ] || { usage >&2; exit 2; }
+        hex=$(parse_input "$1")
+        set_second "$hex" "$1"
+        exit
+        ;;
+    get)
+        [ $# -le 1 ] || { usage >&2; exit 2; }
+        case ${1:-input} in
+            input)
+                v=$(be_get) || die "could not read the current input"
+                label "$v" ;;
+            second)
+                v=$(be_get_vcp "$VCP_SECOND") || die "could not read the second input"
+                label "$v" ;;
+            layout)
+                v=$(be_get_vcp "$VCP_LAYOUT") || die "could not read the PIP/PBP layout"
+                layout_label "$v" ;;
+            *)
+                usage >&2; exit 2 ;;
+        esac
+        exit
+        ;;
 esac
 
 # Everything else takes no extra arguments.
@@ -464,9 +513,8 @@ case $cmd in
             printf '%s %s\n' "$mark" "$(label "$v")"
         done
         ;;
-    get)
-        cur=$(be_get) || die "could not read current input"
-        label "$cur"
+    layouts)
+        layouts
         ;;
     status)
         status

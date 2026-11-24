@@ -39,7 +39,9 @@ is, like `./install.sh /opt/homebrew/bin`.
 
 `swiftbar/msw.10m.sh` is a [SwiftBar](https://swiftbar.app) plugin: a monitor
 icon in the menu bar with a one-click "Switch to DP-1" and a submenu for the
-other inputs. Edit `TARGET` at the top to change the main input.
+other inputs. On monitors with PIP/PBP set up (see below), it also has
+submenus for the layout and second input, and a "Swap inputs" item. Edit
+`TARGET` at the top to change the main input.
 
 ```
 brew install --cask swiftbar
@@ -54,7 +56,9 @@ This symlinks the plugin into SwiftBar's plugin folder (setting that to
 `gnome/` holds a small GNOME Shell extension (GNOME 45+) that adds a "Monitor"
 tile to the Quick Settings panel, next to Wi-Fi and Bluetooth. Clicking the
 tile switches to `TARGET` (DP-2 by default). The arrow opens a list of all
-inputs, with a check next to the current one. Edit `TARGET` at the top of
+inputs, with a check next to the current one. On monitors with PIP/PBP set up
+(see below), the list also has submenus for the layout and second input, and
+a "Swap inputs" item. Edit `TARGET` at the top of
 `gnome/msw@davidtjones.github.io/extension.js` to change the main input.
 
 ```
@@ -101,10 +105,14 @@ On monitors that support it (Dell, so far), `msw` can show two inputs at once:
 msw pbp 50 macbook   # side by side, 50/50, with macbook as the second input
 msw pbp 75           # 75/25 split, keeping the current second input
 msw pip small        # picture-in-picture
+msw second hdmi1     # change only the second input
 msw swap             # swap the main and second input
 msw off              # back to a single input
 msw status           # show the input, layout and second input
+msw layouts          # list layouts, * = current
 ```
+
+`msw get second` and `msw get layout` print just one of those, for scripts.
 
 Dell monitors keep the layout in private VCP code `E9` and the second input in
 `E8`. Layout values differ by model, so they live in `pxp` (linked to
