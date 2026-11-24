@@ -21,8 +21,8 @@ Names are case-insensitive and dashes are optional (`DP-1`, `dp1`,
 ## Install
 
 ```
-git clone <this repo> ~/proj/monitor-switching
-cd ~/proj/monitor-switching
+git clone https://github.com/davidtjones/msw.git ~/proj/msw
+cd ~/proj/msw
 ./install.sh            # or ./install.sh /some/other/bin
 ```
 
