@@ -1,0 +1,12 @@
+# msw PIP/PBP layouts, one "<hex> <pip|pbp> <name>" per line. The first
+# layout of each kind is the default for a bare `msw pip` / `msw pbp`.
+# A value can have more than one name.
+#
+# Values are for VCP E9 on the Dell AW3423DWF. 00 (off) is built in.
+# For pbp, the name is the main input's share of the screen, in percent.
+21 pip small
+22 pip large
+24 pbp 50
+29 pbp 25
+2a pbp 75
+2e pbp 67

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Install msw by symlinking it (and the inputs config) from this repo,
-# so a `git pull` is all it takes to update.
+# Install msw by symlinking it (and the inputs and pxp configs) from this
+# repo, so a `git pull` is all it takes to update.
 #
 # Usage: ./install.sh [bin-dir]    (default: ~/.local/bin)
 
@@ -16,12 +16,14 @@ ln -sf "$repo/msw" "$bin_dir/msw"
 echo "linked $bin_dir/msw"
 
 # Don't clobber a hand-edited config file.
-if [ -e "$config_dir/inputs" ] && [ ! -L "$config_dir/inputs" ]; then
-    echo "kept existing $config_dir/inputs (not a symlink; compare with $repo/inputs)"
-else
-    ln -sf "$repo/inputs" "$config_dir/inputs"
-    echo "linked $config_dir/inputs"
-fi
+for f in inputs pxp; do
+    if [ -e "$config_dir/$f" ] && [ ! -L "$config_dir/$f" ]; then
+        echo "kept existing $config_dir/$f (not a symlink; compare with $repo/$f)"
+    else
+        ln -sf "$repo/$f" "$config_dir/$f"
+        echo "linked $config_dir/$f"
+    fi
+done
 
 case ":$PATH:" in
     *":$bin_dir:"*) ;;

@@ -92,3 +92,34 @@ it with the monitor's buttons, then run `msw get` from another machine to
 read its value.
 
 Set `MSW_PREVIEW_SECS` to change the preview length.
+
+## PIP / PBP
+
+On monitors that support it (Dell, so far), `msw` can show two inputs at once:
+
+```
+msw pbp 50 macbook   # side by side, 50/50, with macbook as the second input
+msw pbp 75           # 75/25 split, keeping the current second input
+msw pip small        # picture-in-picture
+msw swap             # swap the main and second input
+msw off              # back to a single input
+msw status           # show the input, layout and second input
+```
+
+Dell monitors keep the layout in private VCP code `E9` and the second input in
+`E8`. Layout values differ by model, so they live in `pxp` (linked to
+`~/.config/msw/pxp`), one `<hex> <pip|pbp> <name>` per line:
+
+```
+21 pip small
+24 pbp 50
+```
+
+For PBP, the name is the main input's share of the screen in percent. The
+first layout of each kind is what a bare `msw pip` or `msw pbp` uses.
+
+To find the values for a new monitor, pick each layout with the monitor's
+buttons and run `msw status`. Layouts not in `pxp` show up as
+`unknown (0x2b)`. You can also try a raw value directly, like `msw pbp 0x2b`.
+The PIP corner can't be set over DDC on the AW3423DWF, so use the monitor's
+menu for that.

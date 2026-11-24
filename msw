@@ -1,5 +1,6 @@
 #!/bin/sh
-# msw - monitor switch. Switch a monitor's input source over DDC/CI.
+# msw - monitor switch. Switch a monitor's input source over DDC/CI, and
+# control PIP/PBP on monitors that support it.
 #
 # Linux: uses ddcutil. macOS (Apple Silicon): uses m1ddc.
 # Input source is MCCS VCP feature 0x60.
@@ -10,13 +11,23 @@ PREVIEW_SECS=${MSW_PREVIEW_SECS:-8}
 
 usage() {
     cat <<'EOF'
-Usage: msw [-d N] <input>    switch to <input>
-       msw [-d N] ls         list inputs (* = current)
-       msw [-d N] get        print current input
-       msw [-d N] setup      preview each input and give it a name
+Usage: msw [-d N] <input>               switch to <input>
+       msw [-d N] ls                    list inputs (* = current)
+       msw [-d N] get                   print current input
+       msw [-d N] status                print input, PIP/PBP layout and second input
+       msw [-d N] setup                 preview each input and give it a name
+       msw [-d N] pip [size] [input]    picture-in-picture, e.g. msw pip small macbook
+       msw [-d N] pbp [split] [input]   side by side, e.g. msw pbp 50 macbook
+       msw [-d N] swap                  swap the main and second input
+       msw [-d N] off                   turn PIP/PBP off
 
 <input> is a name from setup (like macbook), a standard name like
 DP-1, dp1, HDMI-2, usbc, or a raw value like 0x11 or 17.
+
+[size] and [split] are layout names from ~/.config/msw/pxp, or a raw value
+like 0x24. Without one, the first pip or pbp layout in that file is used.
+The [input] after a layout sets the second picture; without it, the monitor
+keeps the last one.
 
 -d N   target display N (default: first display found)
 
@@ -50,6 +61,47 @@ if [ -r "$CONFIG" ]; then
 fi
 
 TABLE=$(printf '%s\n%s\n' "$USER_TABLE" "$STD_TABLE" | awk 'NF')
+
+# --- PIP/PBP ----------------------------------------------------------------
+# Dell monitors use two private VCP codes for this: E9 holds the layout and E8
+# the second input. Setting the main input to the second input makes the
+# monitor swap them. Layout values differ by model, so they live in a config
+# file, one "<hex> <pip|pbp> <name>" per line (e.g. "24 pbp 50"). 00 is off.
+
+VCP_INPUT=60
+VCP_SECOND=E8
+VCP_LAYOUT=E9
+
+PXP_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/msw/pxp
+PXP_TABLE=
+if [ -r "$PXP_CONFIG" ]; then
+    PXP_TABLE=$(awk '!/^[[:space:]]*(#|$)/ && NF >= 3 {
+        h = tolower($1); sub(/^0x/, "", h); if (length(h) == 1) h = "0" h
+        print h, tolower($2), $3 }' "$PXP_CONFIG")
+fi
+
+# find_layout <kind> <name> -> hex of that layout, or nothing. An empty name
+# gives the first layout of <kind>. Raw values like 0x24 are passed through.
+find_layout() {
+    case $2 in
+        0x*|0X*)
+            fl_v=$(printf '%d' "$2" 2>/dev/null) || return 0
+            if [ "$fl_v" -ge 1 ] && [ "$fl_v" -le 255 ]; then printf '%02x\n' "$fl_v"; fi
+            return 0 ;;
+    esac
+    printf '%s\n' "$PXP_TABLE" | awk -v k="$1" -v n="$(norm "$2")" '
+        $2 == k { m = toupper($3); gsub(/[-_ ]/, "", m); if (n == "" || m == n) { print $1; exit } }'
+}
+
+# layout_label <hex> -> "pbp 50 (0x24)", "off", "unknown (0x2b)"
+layout_label() {
+    if [ "$1" = 00 ]; then
+        echo off
+        return
+    fi
+    ll=$(printf '%s\n' "$PXP_TABLE" | awk -v v="$1" '$1 == v { print $2, $3; exit }')
+    printf '%s (0x%s)\n' "${ll:-unknown}" "$1"
+}
 
 # Normalize a name for matching: case-insensitive, ignore - _ and spaces.
 norm() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -d ' _-'; }
@@ -92,8 +144,9 @@ parse_input() {
 }
 
 # --- backends ---------------------------------------------------------------
-# Each backend provides: be_get (prints hex), be_set <hex>, be_list (prints hex
-# values the monitor supports, one per line).
+# Each backend provides: be_get_vcp <code> (prints the current value as hex),
+# be_set_vcp <code> <hex>, and be_list (prints hex input values the monitor
+# supports, one per line).
 
 DISPLAY_NUM=
 
@@ -108,13 +161,16 @@ Linux)
             ddcutil "$@"
         fi
     }
-    be_get() {
-        # Terse output looks like: VCP 60 SNC x0f
-        ddc getvcp 60 --terse | awk '$1 == "VCP" { sub(/^x/, "", $4); print $4 }'
+    be_get_vcp() {
+        # Terse output looks like "VCP 60 SNC x0f" for simple values, and
+        # "VCP E9 CNC x00 xff x00 x24" (max high/low, current high/low) for
+        # others. Only the low byte matters here.
+        ddc getvcp "$1" --terse | awk '$1 == "VCP" {
+            v = ($3 == "CNC") ? $7 : $4; if (v ~ /^x/) { sub(/^x/, "", v); print v } }'
     }
-    be_set() {
+    be_set_vcp() {
         # --noverify: the monitor often stops answering once it switches away.
-        ddc setvcp 60 "0x$1" --noverify
+        ddc setvcp "$1" "0x$2" --noverify
     }
     be_list() {
         ddc capabilities | awk '
@@ -133,10 +189,26 @@ Darwin)
             m1ddc "$@"
         fi
     }
-    # Some monitors (e.g. Dell) repeat the value in the high byte; only the
-    # low byte is the input.
-    be_get() { printf '%02x\n' "$(( $(m1 get input) & 0xff ))"; }
-    be_set() { m1 set input "$(printf '%d' "0x$1")"; }
+    # m1ddc names the VCP codes it can access.
+    m1_control() {
+        case $1 in
+            60) echo input ;;
+            E8) echo pbp-input ;;
+            E9) echo pbp ;;
+            *) die "m1ddc can't access VCP code $1" ;;
+        esac
+    }
+    be_get_vcp() {
+        m1c=$(m1_control "$1")
+        m1v=$(m1 get "$m1c") || return 1
+        # Some monitors (e.g. Dell) repeat the value in the high byte; only
+        # the low byte matters.
+        printf '%02x\n' "$(( m1v & 0xff ))"
+    }
+    be_set_vcp() {
+        m1c=$(m1_control "$1")
+        m1 set "$m1c" "$(printf '%d' "0x$2")"
+    }
     # m1ddc can't read capabilities, so fall back to the standard table.
     be_list() { printf '%s\n' "$STD_TABLE" | awk '{ print $1 }'; }
     ;;
@@ -144,6 +216,9 @@ Darwin)
     die "unsupported OS: $(uname -s)"
     ;;
 esac
+
+be_get() { be_get_vcp "$VCP_INPUT"; }
+be_set() { be_set_vcp "$VCP_INPUT" "$1"; }
 
 # Values the monitor reports, plus any the user has named.
 all_values() {
@@ -180,7 +255,8 @@ check_name() {
     esac
     cn=$(norm "$1")
     case $cn in
-        LS|LIST|GET|HELP|SETUP|P) echo "'$1' is reserved."; return 1 ;;
+        LS|LIST|GET|STATUS|HELP|SETUP|PIP|PBP|SWAP|OFF|P)
+            echo "'$1' is reserved."; return 1 ;;
     esac
     if printf '%s' "$taken" | grep -qxF "$cn"; then
         echo "'$1' is already used."
@@ -290,6 +366,70 @@ EOF
     echo "Saved."
 }
 
+# --- PIP/PBP commands -------------------------------------------------------
+
+# pxp <pip|pbp> [layout] [input]
+pxp() {
+    kind=$1
+    shift
+    [ -n "$PXP_TABLE" ] || die "no PIP/PBP layouts set up; add them to $PXP_CONFIG (see the README)"
+
+    # The first argument is a layout if it names one. Numbers and raw values
+    # are always layouts, so a typo like "pbp 60" can't become an input.
+    layout=
+    if [ $# -ge 1 ]; then
+        layout=$(find_layout "$kind" "$1")
+        if [ -n "$layout" ]; then
+            shift
+        else
+            case $1 in
+                0x*|0X*) die "bad layout value: $1" ;;
+                *[!0-9]*) ;;  # not a layout, so it's the input
+                *) die "unknown $kind layout: $1 (see $PXP_CONFIG)" ;;
+            esac
+        fi
+    fi
+    if [ -z "$layout" ]; then
+        layout=$(find_layout "$kind" "")
+        [ -n "$layout" ] || die "no $kind layouts in $PXP_CONFIG"
+    fi
+    [ $# -le 1 ] || { usage >&2; exit 2; }
+
+    # Set the second input first: the monitor accepts it even while PIP/PBP
+    # is off, so the picture comes up right the first time.
+    if [ $# -eq 1 ]; then
+        second=$(parse_input "$1" 2>/dev/null) ||
+            die "'$1' isn't a $kind layout or an input (see $PXP_CONFIG and 'msw ls')"
+        main=$(be_get) || die "could not read the current input"
+        [ "$second" != "$main" ] || die "$1 is already the main input (use 'msw swap' to swap them)"
+        be_set_vcp "$VCP_SECOND" "$second"
+    fi
+    be_set_vcp "$VCP_LAYOUT" "$layout"
+}
+
+swap() {
+    layout=$(be_get_vcp "$VCP_LAYOUT") || die "could not read the PIP/PBP layout"
+    [ "$layout" != 00 ] || die "PIP/PBP is off, so there's nothing to swap"
+    second=$(be_get_vcp "$VCP_SECOND") || die "could not read the second input"
+    # Switching the main input to the second one makes the monitor swap them.
+    be_set "$second"
+}
+
+status() {
+    main=$(be_get) || die "could not read the current input"
+    printf 'input:  %s\n' "$(label "$main")"
+    layout=$(be_get_vcp "$VCP_LAYOUT" 2>/dev/null) || layout=
+    if [ -z "$layout" ]; then
+        echo "layout: unavailable (no PIP/PBP over DDC?)"
+        return
+    fi
+    printf 'layout: %s\n' "$(layout_label "$layout")"
+    second=$(be_get_vcp "$VCP_SECOND" 2>/dev/null) || second=
+    if [ -n "$second" ]; then
+        printf 'second: %s\n' "$(label "$second")"
+    fi
+}
+
 # --- main -------------------------------------------------------------------
 
 while getopts d:h opt; do
@@ -301,9 +441,21 @@ while getopts d:h opt; do
 done
 shift $((OPTIND - 1))
 
-[ $# -eq 1 ] || { usage >&2; exit 2; }
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+cmd=$1
+shift
 
-case $1 in
+case $cmd in
+    pip|pbp)
+        pxp "$cmd" "$@"
+        exit
+        ;;
+esac
+
+# Everything else takes no extra arguments.
+[ $# -eq 0 ] || { usage >&2; exit 2; }
+
+case $cmd in
     ls|list)
         cur=$(be_get 2>/dev/null || true)
         for v in $(all_values); do
@@ -316,14 +468,23 @@ case $1 in
         cur=$(be_get) || die "could not read current input"
         label "$cur"
         ;;
+    status)
+        status
+        ;;
     setup)
         setup
+        ;;
+    swap)
+        swap
+        ;;
+    off)
+        be_set_vcp "$VCP_LAYOUT" 00
         ;;
     help)
         usage
         ;;
     *)
-        hex=$(parse_input "$1")
+        hex=$(parse_input "$cmd")
         be_set "$hex"
         ;;
 esac
