@@ -33,6 +33,20 @@ On macOS, `~/.local/bin` is not on `PATH` by default. Either add it in
 `~/.zshrc` (`export PATH="$HOME/.local/bin:$PATH"`) or install somewhere that
 is, like `./install.sh /opt/homebrew/bin`.
 
+## Menu bar (macOS)
+
+`swiftbar/msw.10m.sh` is a [SwiftBar](https://swiftbar.app) plugin: a monitor
+icon in the menu bar with a one-click "Switch to DP-1" and a submenu for the
+other inputs. Edit `TARGET` at the top to change the main input.
+
+```
+brew install --cask swiftbar
+./swiftbar/install.sh
+```
+
+This symlinks the plugin into SwiftBar's plugin folder (setting that to
+`~/.config/swiftbar` if you haven't picked one) and restarts SwiftBar.
+
 ## Non-standard input values
 
 Some monitors don't use the standard values for their inputs. Name them in
