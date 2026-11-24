@@ -25,7 +25,7 @@ echo "Current: $cur | disabled=true"
 
 echo "---"
 echo "Other inputs"
-# `msw ls` lines look like: "* DP-1     (0x0f)"
+# `msw ls` lines look like "* linux (0x0f, DP-1)"; the name is the first word.
 msw ls 2>/dev/null | awk '{ sub(/^\*/, " "); if (!seen[$1]++) print $1 }' | while read -r name; do
     [ "$name" = unknown ] && continue
     [ "$name" = "$TARGET" ] && continue

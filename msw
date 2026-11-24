@@ -6,26 +6,31 @@
 
 set -eu
 
+PREVIEW_SECS=${MSW_PREVIEW_SECS:-8}
+
 usage() {
     cat <<'EOF'
 Usage: msw [-d N] <input>    switch to <input>
        msw [-d N] ls         list inputs (* = current)
        msw [-d N] get        print current input
+       msw [-d N] setup      preview each input and give it a name
 
-<input> is a name like DP-1, dp1, HDMI-2, hdmi2, usbc
-or a raw value like 0x11 or 17.
+<input> is a name from setup (like macbook), a standard name like
+DP-1, dp1, HDMI-2, usbc, or a raw value like 0x11 or 17.
 
 -d N   target display N (default: first display found)
 
-Non-standard values can be named in ~/.config/msw/inputs,
-one "<hex> <name>" per line, e.g. "13 DP-2".
+Names live in ~/.config/msw/inputs, one "<hex> <name>" per line.
 EOF
 }
 
 die() { printf 'msw: %s\n' "$*" >&2; exit 1; }
 
-# Standard MCCS input values (plus common vendor extras).
-TABLE='01 VGA-1
+# --- input names ------------------------------------------------------------
+# Tables are "<2-digit lowercase hex> <name>" lines. First match wins.
+
+# Standard MCCS input values (plus a common vendor extra for USB-C).
+STD_TABLE='01 VGA-1
 02 VGA-2
 03 DVI-1
 04 DVI-2
@@ -35,40 +40,54 @@ TABLE='01 VGA-1
 12 HDMI-2
 1b USB-C'
 
-# Optional overrides for monitors that use non-standard values.
-# One "<hex> <name>" per line, e.g. "13 DP-2". These win over the table above.
+# User names from setup or hand edits. These win over the standard names.
 CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/msw/inputs
+USER_TABLE=
 if [ -r "$CONFIG" ]; then
-    overrides=$(awk '!/^[[:space:]]*(#|$)/ { sub(/^0[xX]/, "", $1); print tolower($1), toupper($2) }' "$CONFIG")
-    TABLE="$overrides
-$TABLE"
+    USER_TABLE=$(awk '!/^[[:space:]]*(#|$)/ && NF >= 2 {
+        h = tolower($1); sub(/^0x/, "", h); if (length(h) == 1) h = "0" h
+        print h, $2 }' "$CONFIG")
 fi
 
-# hex (2 digits, lowercase) -> display name
-name_of() {
-    n=$(printf '%s\n' "$TABLE" | awk -v v="$1" '$1 == v { print $2; exit }')
-    printf '%s\n' "${n:-unknown}"
+TABLE=$(printf '%s\n%s\n' "$USER_TABLE" "$STD_TABLE" | awk 'NF')
+
+# Normalize a name for matching: case-insensitive, ignore - _ and spaces.
+norm() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -d ' _-'; }
+
+# lookup_name <table> <hex> -> first name for that value, or nothing
+lookup_name() { printf '%s\n' "$1" | awk -v v="$2" '$1 == v { print $2; exit }'; }
+
+# label <hex> -> "macbook (0x13)", "linux (0x0f, DP-1)", "unknown (0x13)"
+label() {
+    l_name=$(lookup_name "$TABLE" "$1")
+    l_std=$(lookup_name "$STD_TABLE" "$1")
+    if [ -z "$l_name" ]; then
+        printf 'unknown (0x%s)\n' "$1"
+    elif [ -n "$l_std" ] && [ "$(norm "$l_name")" != "$(norm "$l_std")" ]; then
+        printf '%s (0x%s, %s)\n' "$l_name" "$1" "$l_std"
+    else
+        printf '%s (0x%s)\n' "$l_name" "$1"
+    fi
 }
 
 # user input -> 2-digit lowercase hex value
 parse_input() {
-    raw=$1
-    case $raw in
-        0x*|0X*) v=$(printf '%d' "$raw" 2>/dev/null) || die "bad value: $raw" ;;
+    case $1 in
+        0x*|0X*) v=$(printf '%d' "$1" 2>/dev/null) || die "bad value: $1" ;;
         *[!0-9]*)
-            key=$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]' | tr -d ' _-')
+            key=$(norm "$1")
             case $key in
                 DISPLAYPORT*) key="DP${key#DISPLAYPORT}" ;;
                 USBC1) key=USBC ;;
             esac
             hex=$(printf '%s\n' "$TABLE" | awk -v k="$key" '
-                { n = $2; gsub(/-/, "", n); if (n == k) { print $1; exit } }')
-            [ -n "$hex" ] || die "unknown input: $raw (try 'msw ls')"
+                { n = toupper($2); gsub(/[-_ ]/, "", n); if (n == k) { print $1; exit } }')
+            [ -n "$hex" ] || die "unknown input: $1 (try 'msw ls')"
             printf '%s\n' "$hex"
             return ;;
-        *) v=$raw ;;
+        *) v=$1 ;;
     esac
-    [ "$v" -ge 1 ] && [ "$v" -le 255 ] || die "value out of range: $raw"
+    [ "$v" -ge 1 ] && [ "$v" -le 255 ] || die "value out of range: $1"
     printf '%02x\n' "$v"
 }
 
@@ -119,12 +138,157 @@ Darwin)
     be_get() { printf '%02x\n' "$(( $(m1 get input) & 0xff ))"; }
     be_set() { m1 set input "$(printf '%d' "0x$1")"; }
     # m1ddc can't read capabilities, so fall back to the standard table.
-    be_list() { printf '%s\n' "$TABLE" | awk '{ print $1 }'; }
+    be_list() { printf '%s\n' "$STD_TABLE" | awk '{ print $1 }'; }
     ;;
 *)
     die "unsupported OS: $(uname -s)"
     ;;
 esac
+
+# Values the monitor reports, plus any the user has named.
+all_values() {
+    av=$(be_list 2>/dev/null || true)
+    if [ -z "$av" ]; then
+        av=$(printf '%s\n' "$STD_TABLE" | awk '{ print $1 }')
+    fi
+    printf '%s\n%s\n' "$av" "$USER_TABLE" | awk 'NF && !seen[$1]++ { print $1 }'
+}
+
+# --- setup ------------------------------------------------------------------
+
+# preview <hex>: show that input for a few seconds, then switch back to $home.
+preview() {
+    printf '  Showing it for %ss...' "$PREVIEW_SECS"
+    be_set "$1" >/dev/null 2>&1 || true
+    sleep "$PREVIEW_SECS"
+    if be_set "$home" >/dev/null 2>&1; then
+        echo " back."
+    else
+        echo " couldn't switch back. Use the monitor's buttons."
+    fi
+}
+
+# check_name <name>: print a reason and fail if it can't be used as a name.
+# Reads $taken (normalized names already used in this run).
+check_name() {
+    case $1 in
+        *[!A-Za-z0-9_-]*) echo "Use only letters, digits, - and _."; return 1 ;;
+        [-_]*) echo "Start with a letter or digit."; return 1 ;;
+        0x*|0X*) echo "That looks like a raw value."; return 1 ;;
+        *[!0-9]*) ;;
+        *) echo "That looks like a raw value."; return 1 ;;
+    esac
+    cn=$(norm "$1")
+    case $cn in
+        LS|LIST|GET|HELP|SETUP|P) echo "'$1' is reserved."; return 1 ;;
+    esac
+    if printf '%s' "$taken" | grep -qxF "$cn"; then
+        echo "'$1' is already used."
+        return 1
+    fi
+}
+
+setup() {
+    [ -t 0 ] || die "setup needs an interactive terminal"
+    home=$(be_get) || die "could not read the current input"
+    [ -n "$home" ] || die "could not read the current input"
+    vals=$(all_values)
+    total=$(printf '%s\n' "$vals" | wc -l | tr -d ' ')
+
+    # Never leave the screen on another input if setup is interrupted.
+    trap 'be_set "$home" >/dev/null 2>&1 || true; echo; exit 130' HUP INT TERM
+
+    cat <<EOF
+Found $total inputs. You're on $(label "$home").
+
+A preview switches to an input for ${PREVIEW_SECS}s, then back here.
+If the screen doesn't come back, use the monitor's buttons.
+
+At each name prompt: Enter keeps [the name shown], '-' clears it,
+'p' previews again.
+EOF
+
+    new=    # "<hex> <name>" lines to save
+    taken=  # normalized names used so far, one per line
+    i=0
+    for v in $vals; do
+        i=$((i + 1))
+        cur=$(lookup_name "$TABLE" "$v")
+        printf '\n[%s/%s] %s' "$i" "$total" "$(label "$v")"
+        if [ "$v" = "$home" ]; then
+            echo " - the one you're looking at"
+        else
+            echo
+            printf '  Preview it? [Y/n] '
+            read -r ans || exit 1
+            case $ans in
+                n|N|no) ;;
+                *) preview "$v" ;;
+            esac
+        fi
+
+        while :; do
+            printf '  Name [%s]: ' "$cur"
+            read -r ans || exit 1
+            case $ans in
+                p|P)
+                    if [ "$v" != "$home" ]; then preview "$v"; fi
+                    continue ;;
+                '') ans=$cur ;;
+                -) ans= ;;
+            esac
+            if [ -z "$ans" ]; then break; fi
+            if err=$(check_name "$ans"); then break; fi
+            echo "  $err"
+        done
+
+        if [ -n "$ans" ]; then
+            taken="$taken$(norm "$ans")
+"
+            # Standard names always work, so only save custom ones.
+            if [ "$ans" != "$(lookup_name "$STD_TABLE" "$v")" ]; then
+                new="$new$v $ans
+"
+            fi
+        fi
+    done
+    trap - HUP INT TERM
+
+    # Keep saved names for values this run didn't cover.
+    flat=" $(printf '%s ' $vals)"
+    kept=$(printf '%s\n' "$USER_TABLE" | while read -r h n; do
+        case $flat in
+            *" $h "*) ;;
+            *) if [ -n "$h" ]; then echo "$h $n"; fi ;;
+        esac
+    done)
+    if [ -n "$kept" ]; then
+        new="$new$kept
+"
+    fi
+
+    echo
+    if [ -n "$new" ]; then
+        echo "Names to save in $CONFIG:"
+        printf '%s' "$new" | sed 's/^/  /'
+    else
+        echo "No custom names. Standard names (DP-1, HDMI-1, ...) still work."
+    fi
+    printf 'Save? [Y/n] '
+    read -r ans || exit 1
+    case $ans in
+        n|N|no) echo "Not saved."; return ;;
+    esac
+
+    mkdir -p "$(dirname "$CONFIG")"
+    # Write in place (not via mv) so a symlinked config stays a symlink.
+    {
+        echo '# msw input names, one "<hex> <name>" per line. Written by `msw setup`.'
+        echo '# Standard names (DP-1, HDMI-1, ...) always work too.'
+        printf '%s' "$new"
+    } > "$CONFIG"
+    echo "Saved."
+}
 
 # --- main -------------------------------------------------------------------
 
@@ -142,17 +306,18 @@ shift $((OPTIND - 1))
 case $1 in
     ls|list)
         cur=$(be_get 2>/dev/null || true)
-        vals=$(be_list 2>/dev/null || true)
-        [ -n "$vals" ] || vals=$(printf '%s\n' "$TABLE" | awk '{ print $1 }')
-        for v in $vals; do
+        for v in $(all_values); do
             mark=' '
-            [ "$v" = "$cur" ] && mark='*'
-            printf '%s %-8s (0x%s)\n' "$mark" "$(name_of "$v")" "$v"
+            if [ "$v" = "$cur" ]; then mark='*'; fi
+            printf '%s %s\n' "$mark" "$(label "$v")"
         done
         ;;
     get)
         cur=$(be_get) || die "could not read current input"
-        printf '%s (0x%s)\n' "$(name_of "$cur")" "$cur"
+        label "$cur"
+        ;;
+    setup)
+        setup
         ;;
     help)
         usage
